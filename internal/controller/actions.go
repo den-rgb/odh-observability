@@ -21,9 +21,12 @@ import (
 	"embed"
 	"fmt"
 	"os"
+	"strings"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -75,11 +78,17 @@ const (
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
 	ClusterLogForwarderTemplate                      = "resources/cluster-log-forwarder.tmpl.yaml"
 	ClusterLogForwarderRBACTemplate                  = "resources/cluster-log-forwarder-rbac.tmpl.yaml"
+	Korrel8rDeploymentTemplate                       = "resources/korrel8r-deployment.tmpl.yaml"
+	Korrel8rConfigTemplate                           = "resources/korrel8r-config.tmpl.yaml"
+	Korrel8rRBACTemplate                             = "resources/korrel8r-rbac.tmpl.yaml"
+	Korrel8rNetworkPolicyTemplate                    = "resources/korrel8r-network-policy.tmpl.yaml"
 
 	PersesTempoDatasourceName = "tempo-datasource"
 	PersesTempoDashboardName  = "data-science-tempo-traces"
 
 	defaultMonitoringNamespace = "opendatahub"
+	clusterLoggingNamespace    = "openshift-logging"
+	Korrel8rServiceName        = "korrel8r"
 	conditionTypeReady         = "Ready"
 	conditionStatusTrue        = "True"
 )
@@ -608,7 +617,7 @@ func deployClusterLogForwarder(
 		return nil
 	}
 
-	logReady, err := isClusterLogForwarderReady(ctx, c, monitoring)
+	logReady, err := isClusterLogForwarderReady(ctx, c)
 	if err != nil {
 		return fmt.Errorf("checking ClusterLogForwarder readiness: %w", err)
 	}
@@ -626,6 +635,86 @@ func deployClusterLogForwarder(
 		src(ClusterLogForwarderRBACTemplate),
 	)
 	return nil
+}
+
+// deployKorrel8r deploys the RHOAI-owned correlation service whenever at least
+// one observability signal is configured. The service itself handles backend
+// availability independently, so a missing optional backend must not prevent
+// the other configured stores from being exposed.
+func deployKorrel8r(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) error {
+	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil && monitoring.Spec.Logs == nil {
+		cm.MarkNotConfigured(conditions.ConditionKorrel8rAvailable,
+			"Korrel8rNotConfigured", "Metrics, traces, and logs are not configured in Monitoring CR")
+		return nil
+	}
+
+	ready, err := korrel8rReady(ctx, c, monitoringNamespace(monitoring))
+	if err != nil {
+		return fmt.Errorf("checking Korrel8r readiness: %w", err)
+	}
+	if ready {
+		cm.MarkTrue(conditions.ConditionKorrel8rAvailable)
+	} else {
+		cm.MarkFalse(conditions.ConditionKorrel8rAvailable,
+			"Korrel8rNotReady",
+			"Korrel8r Deployment or Service endpoint is not ready")
+	}
+	*sources = append(*sources,
+		src(Korrel8rConfigTemplate),
+		src(Korrel8rDeploymentTemplate),
+		src(Korrel8rRBACTemplate),
+		src(Korrel8rNetworkPolicyTemplate),
+	)
+	return nil
+}
+
+// korrel8rReady reports whether the rendered Deployment has ready replicas and
+// its Service has at least one ready endpoint. The endpoint check prevents a
+// selector or Service drift from being reported as an available service.
+func korrel8rReady(ctx context.Context, c client.Client, namespace string) (bool, error) {
+	deployment := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, deployment); err != nil {
+		if k8serr.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("getting Korrel8r Deployment: %w", err)
+	}
+	desiredReplicas := int32(1)
+	if deployment.Spec.Replicas != nil {
+		desiredReplicas = *deployment.Spec.Replicas
+	}
+	if deployment.Status.ReadyReplicas < desiredReplicas {
+		return false, nil
+	}
+
+	service := &corev1.Service{}
+	if err := c.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, service); err != nil {
+		if k8serr.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("getting Korrel8r Service: %w", err)
+	}
+
+	endpointSlices := &discoveryv1.EndpointSliceList{}
+	if err := c.List(ctx, endpointSlices,
+		client.InNamespace(namespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: service.Name}); err != nil {
+		return false, fmt.Errorf("listing Korrel8r endpoint slices: %w", err)
+	}
+	for _, endpointSlice := range endpointSlices.Items {
+		for _, endpoint := range endpointSlice.Endpoints {
+			if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // deployWebhookInfrastructure reports the webhook availability condition.
@@ -695,7 +784,7 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 
 		condType, _, _ := unstructured.NestedString(condMap, "type")
 		condStatus, _, _ := unstructured.NestedString(condMap, "status")
-		if condType == conditionTypeReady && condStatus == conditionStatusTrue {
+		if (condType == conditionTypeReady || strings.HasSuffix(condType, "/"+conditionTypeReady)) && condStatus == conditionStatusTrue {
 			return true, nil
 		}
 	}
@@ -727,13 +816,13 @@ func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1
 }
 
 // isClusterLogForwarderReady checks if the ClusterLogForwarder CR exists and is in a Ready state.
-func isClusterLogForwarderReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
+func isClusterLogForwarderReady(ctx context.Context, c client.Client) (bool, error) {
 	clusterLogForwarder := &unstructured.Unstructured{}
 	clusterLogForwarder.SetGroupVersionKind(gvk.ClusterLogForwarder)
 
 	err := c.Get(ctx, types.NamespacedName{
 		Name:      "data-science-cluster-log-forwarder",
-		Namespace: monitoringNamespace(monitoring),
+		Namespace: clusterLoggingNamespace,
 	}, clusterLogForwarder)
 	if err != nil {
 		if k8serr.IsNotFound(err) {

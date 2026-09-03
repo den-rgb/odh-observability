@@ -1,0 +1,55 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{.Korrel8rServiceName}}
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{.Korrel8rServiceName}}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.Namespace}}
+      ports:
+        - protocol: TCP
+          port: 8443
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 53
+        - protocol: TCP
+          port: 5353
+    {{ if .Korrel8rAPIServerCIDRs }}
+    - to:
+      {{ range .Korrel8rAPIServerCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+      {{ end }}
+      ports:
+        - protocol: TCP
+          port: 6443
+    {{ end }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.Namespace}}
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 10902

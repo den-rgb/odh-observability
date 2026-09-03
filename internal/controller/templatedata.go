@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -31,6 +32,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -72,6 +74,12 @@ const (
 	defaultTempoCPURequest    = "100m"
 	defaultTempoMemoryRequest = "256Mi"
 
+	defaultKorrel8rCPURequest    = "50m"
+	defaultKorrel8rMemoryRequest = "64Mi"
+	defaultKorrel8rCPULimit      = "200m"
+	defaultKorrel8rMemoryLimit   = "512Mi"
+	kubernetesServiceName        = "kubernetes"
+
 	persesV1Alpha2 = "v1alpha2"
 
 	// Security limits for exporter configurations.
@@ -98,6 +106,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	if persesAPIVersion == "" {
 		persesAPIVersion = persesV1Alpha2
 	}
+	monitoringNamespace := monitoringNamespace(monitoring)
 
 	isSNO, err := openshift.IsSingleNodeCluster(ctx, c)
 	if err != nil {
@@ -105,24 +114,32 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	templateData := map[string]any{
-		"Namespace":            monitoring.Spec.Namespace,
-		"GatewayNamespace":     getEnvOrDefault("GATEWAY_NAMESPACE", monitoring.Spec.Namespace),
-		"Traces":               monitoring.Spec.Traces != nil,
-		"Metrics":              monitoring.Spec.Metrics != nil,
-		"AcceleratorMetrics":   monitoring.Spec.Metrics != nil,
-		"OperatorNamespace":    operatorNamespace,
-		"OperatorName":         getEnvOrDefault("OPERATOR_NAME", "odh-observability"),
-		"OperatorPodPrefix":    getEnvOrDefault("OPERATOR_POD_PREFIX", "odh-observability"),
-		"MetricsExporters":     make(map[string]string),
-		"MetricsExporterNames": []string{},
-		"PersesImage":          getPersesImage(),
-		"PersesAPIVersion":     persesAPIVersion,
+		"Namespace":              monitoringNamespace,
+		"GatewayNamespace":       getEnvOrDefault("GATEWAY_NAMESPACE", monitoringNamespace),
+		"Traces":                 monitoring.Spec.Traces != nil,
+		"Metrics":                monitoring.Spec.Metrics != nil,
+		"Logs":                   monitoring.Spec.Logs != nil,
+		"AcceleratorMetrics":     monitoring.Spec.Metrics != nil,
+		"OperatorNamespace":      operatorNamespace,
+		"OperatorName":           getEnvOrDefault("OPERATOR_NAME", "odh-observability"),
+		"OperatorPodPrefix":      getEnvOrDefault("OPERATOR_POD_PREFIX", "odh-observability"),
+		"MetricsExporters":       make(map[string]string),
+		"MetricsExporterNames":   []string{},
+		"PersesImage":            getPersesImage(),
+		"PersesAPIVersion":       persesAPIVersion,
+		"Korrel8rImage":          getKorrel8rImage(),
+		"Korrel8rServiceName":    Korrel8rServiceName,
+		"Korrel8rRequestTimeout": "30s",
+		"Korrel8rSessionTimeout": "5m",
 	}
 
 	addResourceData(templateData)
 	addImageURLs(templateData)
 
 	if err := addTLSData(ctx, c, templateData); err != nil {
+		return nil, err
+	}
+	if err := addKorrel8rAPIServerData(ctx, c, monitoring, templateData); err != nil {
 		return nil, err
 	}
 
@@ -133,7 +150,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	if traces := monitoring.Spec.Traces; traces != nil {
-		if err := addTracesTemplateData(templateData, traces, monitoring.Spec.Namespace); err != nil {
+		if err := addTracesTemplateData(templateData, traces, monitoringNamespace); err != nil {
 			return nil, err
 		}
 	}
@@ -141,7 +158,11 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	// LokiStack configuration
 	lokiStackName := "data-science-lokistack"
 	templateData["LokiStackName"] = lokiStackName
-
+	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
+	// application tenant is the pinned tenant for inference logs.
+	templateData["LokiTenant"] = "application"
+	templateData["ThanosQuerierEndpoint"] = fmt.Sprintf("http://thanos-querier-data-science-thanos-querier.%s.svc.cluster.local:10902", monitoringNamespace)
+	templateData["LokiQueryEndpoint"] = fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, monitoringNamespace)
 	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
 	var lokiStorage *v1alpha1.LokiStorageConfig
 	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
@@ -170,11 +191,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	// Usage logs collector configuration (independent of Loki storage resolution)
 	templateData["UsageLogsCollectorName"] = "usage-logs"
 	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		namespace := monitoring.Spec.Namespace
-		if namespace == "" {
-			namespace = "opendatahub"
-		}
-		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", lokiStackName, namespace)
+		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", lokiStackName, monitoringNamespace)
 		templateData["UsageLogs"] = true
 		templateData["UsageLogsEndpoint"] = gatewayURL
 	} else {
@@ -186,6 +203,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	clusterLogForwarderName := "data-science-cluster-log-forwarder"
 	templateData["ClusterLogForwarderName"] = clusterLogForwarderName
 	templateData["ClusterLogForwarderServiceAccount"] = clusterLogForwarderName + "-collector"
+	templateData["ClusterLoggingNamespace"] = clusterLoggingNamespace
 
 	if logs := monitoring.Spec.Logs; logs != nil {
 		var namespaces []string
@@ -223,6 +241,63 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	templateData["CollectorReplicas"] = collectorReplicas
 
 	return templateData, nil
+}
+
+func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {
+	templateData["Korrel8rAPIServerCIDRs"] = []string{}
+	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil && monitoring.Spec.Logs == nil {
+		return nil
+	}
+
+	endpointSlices := &discoveryv1.EndpointSliceList{}
+	if err := c.List(ctx, endpointSlices,
+		client.InNamespace("default"),
+		client.MatchingLabels{discoveryv1.LabelServiceName: kubernetesServiceName},
+	); err != nil {
+		return fmt.Errorf("listing Kubernetes API EndpointSlices for Korrel8r: %w", err)
+	}
+
+	apiServerCIDRs, err := kubernetesAPIServerCIDRs(endpointSlices.Items)
+	if err != nil {
+		return fmt.Errorf("resolving Kubernetes API endpoint CIDRs for Korrel8r: %w", err)
+	}
+	templateData["Korrel8rAPIServerCIDRs"] = apiServerCIDRs
+	return nil
+}
+
+func kubernetesAPIServerCIDRs(endpointSlices []discoveryv1.EndpointSlice) ([]string, error) {
+	cidrs := make(map[string]struct{})
+	for _, endpointSlice := range endpointSlices {
+		if endpointSlice.AddressType != discoveryv1.AddressTypeIPv4 && endpointSlice.AddressType != discoveryv1.AddressTypeIPv6 {
+			continue
+		}
+		for _, endpoint := range endpointSlice.Endpoints {
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
+			for _, address := range endpoint.Addresses {
+				ip, err := netip.ParseAddr(address)
+				if err != nil {
+					return nil, fmt.Errorf("parsing Kubernetes API endpoint address %q: %w", address, err)
+				}
+				if endpointSlice.AddressType == discoveryv1.AddressTypeIPv4 && !ip.Is4() ||
+					endpointSlice.AddressType == discoveryv1.AddressTypeIPv6 && !ip.Is6() {
+					return nil, fmt.Errorf("Kubernetes API endpoint address %q does not match EndpointSlice address type %q", address, endpointSlice.AddressType)
+				}
+				cidrs[fmt.Sprintf("%s/%d", ip.String(), ip.BitLen())] = struct{}{}
+			}
+		}
+	}
+	if len(cidrs) == 0 {
+		return nil, errors.New("Kubernetes API EndpointSlices contain no ready IP addresses")
+	}
+
+	result := make([]string, 0, len(cidrs))
+	for cidr := range cidrs {
+		result = append(result, cidr)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 // checkMonitoringPreconditions verifies that prerequisite operators are installed.
@@ -304,6 +379,11 @@ func addResourceData(templateData map[string]any) {
 	templateData["TempoMemoryLimit"] = defaultTempoMemoryLimit
 	templateData["TempoCPURequest"] = defaultTempoCPURequest
 	templateData["TempoMemoryRequest"] = defaultTempoMemoryRequest
+
+	templateData["Korrel8rCPURequest"] = defaultKorrel8rCPURequest
+	templateData["Korrel8rMemoryRequest"] = defaultKorrel8rMemoryRequest
+	templateData["Korrel8rCPULimit"] = defaultKorrel8rCPULimit
+	templateData["Korrel8rMemoryLimit"] = defaultKorrel8rMemoryLimit
 }
 
 func addStorageData(metrics *v1alpha1.Metrics, templateData map[string]any) {
@@ -426,6 +506,16 @@ func addImageURLs(templateData map[string]any) {
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
+}
+
+// getKorrel8rImage returns the pinned Korrel8r image, allowing release
+// manifests to override it with the related-image environment contract.
+func getKorrel8rImage() string {
+	// Keep the default aligned with the supported Cluster Observability Operator
+	// image. The COO build includes the top-level tuning configuration used by
+	// the Monitoring CR; the older upstream 0.7.x image rejects that section.
+	const defaultImage = "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22"
+	return getEnvOrDefault("RELATED_IMAGE_KORREL8R_IMAGE", defaultImage)
 }
 
 func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {

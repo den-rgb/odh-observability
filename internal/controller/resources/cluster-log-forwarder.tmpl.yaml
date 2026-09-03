@@ -2,7 +2,7 @@ apiVersion: observability.openshift.io/v1
 kind: ClusterLogForwarder
 metadata:
   name: {{.ClusterLogForwarderName}}
-  namespace: {{.Namespace}}
+  namespace: {{.ClusterLoggingNamespace}}
 spec:
   serviceAccount:
     name: {{.ClusterLogForwarderServiceAccount}}
@@ -30,7 +30,7 @@ spec:
           from: serviceAccount
     tls:
       ca:
-        configMapName: {{.LokiStackName}}-gateway-ca-bundle
+        configMapName: openshift-service-ca.crt
         key: service-ca.crt
   pipelines:
   - name: inference-logs-to-loki

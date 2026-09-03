@@ -28,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -164,6 +165,40 @@ func TestReadPlatformVersion(t *testing.T) {
 		}
 		if got != "2.20.0" {
 			t.Errorf("want 2.20.0, got %q", got)
+		}
+	})
+}
+
+func TestValidateMonitoringNamespace(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+
+	t.Run("unset configuration is allowed", func(t *testing.T) {
+		t.Setenv("MONITORING_NAMESPACE", "")
+		if err := validateMonitoringNamespace(m); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("matching configuration is allowed", func(t *testing.T) {
+		t.Setenv("MONITORING_NAMESPACE", m.Spec.Namespace)
+		if err := validateMonitoringNamespace(m); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("empty namespace uses the effective default", func(t *testing.T) {
+		emptyNamespace := m.DeepCopy()
+		emptyNamespace.Spec.Namespace = ""
+		t.Setenv("MONITORING_NAMESPACE", defaultMonitoringNamespace)
+		if err := validateMonitoringNamespace(emptyNamespace); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("mismatched configuration is rejected", func(t *testing.T) {
+		t.Setenv("MONITORING_NAMESPACE", "redhat-ods-monitoring")
+		if err := validateMonitoringNamespace(m); err == nil {
+			t.Fatal("expected namespace mismatch error")
 		}
 	})
 }
@@ -530,6 +565,67 @@ func TestPlatformConfigWatch_EnqueuesMonitoring(t *testing.T) {
 	}
 	if reqs[0].Name != v1alpha1.MonitoringInstanceName {
 		t.Errorf("mapped name: want %q, got %q", v1alpha1.MonitoringInstanceName, reqs[0].Name)
+	}
+}
+
+func TestKorrel8rEndpointSliceWatch_EnqueuesForKorrel8rAndKubernetesAPI(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "test-ns")
+
+	pred := predicate.NewPredicateFuncs(isKorrel8rEndpointSlice)
+	for _, test := range []struct {
+		name  string
+		slice *discoveryv1.EndpointSlice
+		want  bool
+	}{
+		{
+			name: "Kubernetes API endpoint in default namespace",
+			slice: &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				Namespace: metav1.NamespaceDefault,
+				Labels:    map[string]string{discoveryv1.LabelServiceName: kubernetesServiceName},
+			}},
+			want: true,
+		},
+		{
+			name: "Korrel8r endpoint",
+			slice: &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test-ns",
+				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
+			}},
+			want: true,
+		},
+		{
+			name: "Korrel8r endpoint outside monitoring namespace",
+			slice: &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "other-ns",
+				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
+			}},
+			want: false,
+		},
+		{
+			name: "Kubernetes endpoint outside default namespace",
+			slice: &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "other-ns",
+				Labels:    map[string]string{discoveryv1.LabelServiceName: kubernetesServiceName},
+			}},
+			want: false,
+		},
+		{
+			name: "unrelated endpoint",
+			slice: &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+				Namespace: metav1.NamespaceDefault,
+				Labels:    map[string]string{discoveryv1.LabelServiceName: "unrelated"},
+			}},
+			want: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := pred.Create(event.CreateEvent{Object: test.slice}); got != test.want {
+				t.Errorf("Create: want %t, got %t", test.want, got)
+			}
+			if got := pred.Update(event.UpdateEvent{ObjectOld: test.slice, ObjectNew: test.slice}); got != test.want {
+				t.Errorf("Update: want %t, got %t", test.want, got)
+			}
+		})
 	}
 }
 

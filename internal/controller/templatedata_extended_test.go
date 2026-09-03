@@ -18,17 +18,21 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 )
@@ -576,6 +580,20 @@ func TestGetPersesImage_Override(t *testing.T) {
 	}
 }
 
+func TestGetKorrel8rImage_Default(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_KORREL8R_IMAGE", "")
+	if got := getKorrel8rImage(); got != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22" {
+		t.Errorf("unexpected default Korrel8r image: %q", got)
+	}
+}
+
+func TestGetKorrel8rImage_Override(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_KORREL8R_IMAGE", "custom-korrel8r:1.0")
+	if got := getKorrel8rImage(); got != "custom-korrel8r:1.0" {
+		t.Errorf("want custom-korrel8r:1.0, got %q", got)
+	}
+}
+
 // --- buildTemplateData ---
 
 func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
@@ -602,6 +620,89 @@ func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
 	}
 }
 
+func TestBuildTemplateData_UsesEffectiveMonitoringNamespace(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = ""
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if data["Namespace"] != defaultMonitoringNamespace {
+		t.Errorf("Namespace: want %q, got %v", defaultMonitoringNamespace, data["Namespace"])
+	}
+	if data["UsageLogsEndpoint"] != "https://data-science-lokistack-gateway-http.opendatahub.svc.cluster.local:8080/api/logs/v1/application/otlp" {
+		t.Errorf("UsageLogsEndpoint: unexpected effective namespace endpoint %v", data["UsageLogsEndpoint"])
+	}
+}
+
+func TestBuildTemplateData_Korrel8rConfiguration(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Traces = &v1alpha1.Traces{
+		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if data["Logs"] != true {
+		t.Error("Logs: want true")
+	}
+	if data["Korrel8rImage"] != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22" {
+		t.Errorf("unexpected Korrel8r image: %v", data["Korrel8rImage"])
+	}
+	if data["Korrel8rRequestTimeout"] != "30s" || data["Korrel8rSessionTimeout"] != "5m" {
+		t.Errorf("unexpected Korrel8r timeouts: request=%v session=%v", data["Korrel8rRequestTimeout"], data["Korrel8rSessionTimeout"])
+	}
+	if data["Korrel8rMemoryLimit"] != "512Mi" {
+		t.Errorf("Korrel8r memory limit: want 512Mi, got %v", data["Korrel8rMemoryLimit"])
+	}
+	if data["ThanosQuerierEndpoint"] != "http://thanos-querier-data-science-thanos-querier.test-ns.svc.cluster.local:10902" {
+		t.Errorf("unexpected Thanos endpoint: %v", data["ThanosQuerierEndpoint"])
+	}
+	if data["LokiTenant"] != "application" {
+		t.Errorf("unexpected Loki tenant: %v", data["LokiTenant"])
+	}
+}
+
+func TestBuildTemplateData_Korrel8rAPIServerEndpointDiscoveryFailureBlocksRendering(t *testing.T) {
+	t.Parallel()
+
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithInterceptorFuncs(kubernetesAPIServerEndpointSliceListForbidden()).Build()
+	_, err := buildTemplateData(context.Background(), cli, m, "")
+	if err == nil {
+		t.Fatal("expected API endpoint discovery failure to block rendering")
+	}
+}
+
+func kubernetesAPIServerEndpointSliceListForbidden() interceptor.Funcs {
+	return interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*discoveryv1.EndpointSliceList); ok {
+				return errors.New("forbidden")
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+}
+
 func TestBuildTemplateData_WithMetrics(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
@@ -612,7 +713,7 @@ func TestBuildTemplateData_WithMetrics(t *testing.T) {
 		},
 	}
 
-	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -632,7 +733,7 @@ func TestBuildTemplateData_CollectorReplicasExplicit(t *testing.T) {
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.CollectorReplicas = 5
 
-	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

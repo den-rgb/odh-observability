@@ -41,6 +41,7 @@ func monitoringTestSuite(t *testing.T) {
 
 	t.Run("Base Configuration", monitoringServiceCtx.runBaseConfigurationTests)
 	t.Run("Metrics & MonitoringStack", monitoringServiceCtx.runMetricsAndMonitoringStackTests)
+	t.Run("Korrel8r", monitoringServiceCtx.runKorrel8rTests)
 	t.Run("OpenTelemetry Collector", monitoringServiceCtx.runCollectorTests)
 	t.Run("Target Allocator", monitoringServiceCtx.runTargetAllocatorTests)
 	t.Run("Thanos Querier", monitoringServiceCtx.runThanosQuerierTests)

@@ -18,17 +18,24 @@ package controller
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	"gopkg.in/yaml.v3"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -53,6 +60,22 @@ func registerCRDs(s *runtime.Scheme, gvks ...schema.GroupVersionKind) {
 			Kind:    g.Kind + "List",
 		}
 		s.AddKnownTypeWithName(listGVK, &unstructured.UnstructuredList{})
+	}
+}
+
+func kubernetesAPIServerEndpointSlice() *discoveryv1.EndpointSlice {
+	ready := true
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubernetesServiceName,
+			Namespace: metav1.NamespaceDefault,
+			Labels:    map[string]string{discoveryv1.LabelServiceName: kubernetesServiceName},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"172.20.0.1"},
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+		}},
 	}
 }
 
@@ -795,6 +818,82 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 	}
 }
 
+func TestDeployClusterLogForwarder_UsesClusterLoggingNamespace(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.ClusterLogForwarder, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = &v1alpha1.Logs{}
+
+	readyLoki := &unstructured.Unstructured{}
+	readyLoki.SetGroupVersionKind(gvk.LokiStack)
+	readyLoki.SetName("data-science-lokistack")
+	readyLoki.SetNamespace(m.Spec.Namespace)
+	_ = unstructured.SetNestedSlice(readyLoki.Object, []any{
+		map[string]any{"type": "Ready", "status": "True"},
+	}, "status", "conditions")
+
+	readyCLF := &unstructured.Unstructured{}
+	readyCLF.SetGroupVersionKind(gvk.ClusterLogForwarder)
+	readyCLF.SetName("data-science-cluster-log-forwarder")
+	readyCLF.SetNamespace("openshift-logging")
+	_ = unstructured.SetNestedSlice(readyCLF.Object, []any{
+		map[string]any{"type": "Ready", "status": "True"},
+	}, "status", "conditions")
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(readyLoki, readyCLF, kubernetesAPIServerEndpointSlice()).
+		WithStatusSubresource(readyLoki, readyCLF).
+		Build()
+
+	if err := deployClusterLogForwarder(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	condition := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("ClusterLogForwarderAvailable: want True, got %v", condition)
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering ClusterLogForwarder templates: %v", err)
+	}
+	for i := range objects {
+		if objects[i].GetKind() != "ClusterLogForwarder" && objects[i].GetKind() != "ServiceAccount" {
+			continue
+		}
+		if objects[i].GetNamespace() != "openshift-logging" {
+			t.Fatalf("%s %q: want namespace openshift-logging, got %q", objects[i].GetKind(), objects[i].GetName(), objects[i].GetNamespace())
+		}
+		if objects[i].GetKind() != "ClusterLogForwarder" {
+			continue
+		}
+		outputs, found, err := unstructured.NestedSlice(objects[i].Object, "spec", "outputs")
+		if err != nil || !found || len(outputs) != 1 {
+			t.Fatalf("reading ClusterLogForwarder output: found=%t count=%d err=%v", found, len(outputs), err)
+		}
+		output, ok := outputs[0].(map[string]any)
+		if !ok {
+			t.Fatalf("ClusterLogForwarder output has unexpected type %T", outputs[0])
+		}
+		tls, ok := output["tls"].(map[string]any)
+		if !ok {
+			t.Fatalf("ClusterLogForwarder output has no TLS configuration: %#v", output)
+		}
+		ca, ok := tls["ca"].(map[string]any)
+		if !ok || ca["configMapName"] != "openshift-service-ca.crt" {
+			t.Fatalf("ClusterLogForwarder must use the service CA in openshift-logging, got %#v", ca)
+		}
+	}
+}
+
 func TestDeployClusterLogForwarder_ExplicitInferenceNamespaces(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.ClusterLogForwarder, gvk.LokiStack)
@@ -819,7 +918,7 @@ func TestDeployClusterLogForwarder_ExplicitInferenceNamespaces(t *testing.T) {
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki).WithStatusSubresource(readyLoki).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki, kubernetesAPIServerEndpointSlice()).WithStatusSubresource(readyLoki).Build()
 	err := deployClusterLogForwarder(context.Background(), cli, m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -870,7 +969,7 @@ func TestDeployClusterLogForwarder_MaliciousNamespacesFiltered(t *testing.T) {
 		},
 	}, "status", "conditions")
 
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki).WithStatusSubresource(readyLoki).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki, kubernetesAPIServerEndpointSlice()).WithStatusSubresource(readyLoki).Build()
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
 		t.Fatalf("buildTemplateData error: %v", err)
@@ -915,7 +1014,7 @@ func TestDeployClusterLogForwarder_AllNamespacesInvalid(t *testing.T) {
 		},
 	}, "status", "conditions")
 
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki).WithStatusSubresource(readyLoki).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki, kubernetesAPIServerEndpointSlice()).WithStatusSubresource(readyLoki).Build()
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
 		t.Fatalf("buildTemplateData error: %v", err)
@@ -949,7 +1048,7 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
 	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -978,5 +1077,342 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 	}
 	if data["UsageLogs"] != false {
 		t.Errorf("expected UsageLogs=false when usageLogs is nil, got %v", data["UsageLogs"])
+	}
+}
+
+func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
+	tests := []struct {
+		name         string
+		configure    func(*v1alpha1.Monitoring)
+		wantSources  int
+		wantStatus   metav1.ConditionStatus
+		wantSeverity platformcommon.ConditionSeverity
+		wantReason   string
+	}{
+		{
+			name:         "no signals",
+			wantStatus:   metav1.ConditionFalse,
+			wantSeverity: platformcommon.ConditionSeverityInfo,
+			wantReason:   "Korrel8rNotConfigured",
+		},
+		{
+			name: "metrics",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+			},
+			wantSources: 4,
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  "Korrel8rNotReady",
+		},
+		{
+			name: "traces",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{
+					Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+				}
+			},
+			wantSources: 4,
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  "Korrel8rNotReady",
+		},
+		{
+			name: "logs",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Logs = &v1alpha1.Logs{}
+			},
+			wantSources: 4,
+			wantStatus:  metav1.ConditionFalse,
+			wantReason:  "Korrel8rNotReady",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			if tt.configure != nil {
+				tt.configure(m)
+			}
+
+			cm := conditions.NewConditionsManager(m, m.Generation)
+			var sources []rendertemplate.TemplateSource
+			cli := fake.NewClientBuilder().WithScheme(newActionsTestScheme(t)).Build()
+			if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(sources) != tt.wantSources {
+				t.Errorf("sources: want %d, got %d", tt.wantSources, len(sources))
+			}
+			condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
+			if condition == nil {
+				t.Fatal("expected Korrel8rAvailable condition")
+			}
+			if condition.Status != tt.wantStatus {
+				t.Errorf("status: want %s, got %s", tt.wantStatus, condition.Status)
+			}
+			if tt.wantSeverity != "" && condition.Severity != tt.wantSeverity {
+				t.Errorf("severity: want %s, got %s", tt.wantSeverity, condition.Severity)
+			}
+			if tt.wantReason != "" && condition.Reason != tt.wantReason {
+				t.Errorf("reason: want %s, got %s", tt.wantReason, condition.Reason)
+			}
+		})
+	}
+}
+
+func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+
+	replicas := int32(1)
+	cli := fake.NewClientBuilder().WithScheme(newActionsTestScheme(t)).WithObjects(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: Korrel8rServiceName, Namespace: m.Spec.Namespace},
+			Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+			Status:     appsv1.DeploymentStatus{ReadyReplicas: replicas},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: Korrel8rServiceName, Namespace: m.Spec.Namespace},
+		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      Korrel8rServiceName + "-abcde",
+				Namespace: m.Spec.Namespace,
+				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: func() *bool { value := true; return &value }(),
+				},
+			}},
+		},
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
+	if condition == nil {
+		t.Fatal("expected Korrel8rAvailable condition")
+	}
+	if condition.Status != metav1.ConditionTrue {
+		t.Fatalf("status: want True, got %s", condition.Status)
+	}
+}
+
+func TestDeployKorrel8r_RendersOwnedResourcesAndConfiguredStores(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Traces = &v1alpha1.Traces{
+		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{}
+
+	// The backend Services are created asynchronously by their operators. Their
+	// absence on the initial render must not omit configured stores permanently.
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployKorrel8r error: %v", err)
+	}
+
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering Korrel8r templates: %v", err)
+	}
+	if len(objects) != 8 {
+		t.Fatalf("expected eight rendered resources, got %d", len(objects))
+	}
+
+	resources := findKorrel8rRenderedResources(t, objects)
+	assertKorrel8rConfiguration(t, resources.config, resources.metricsRule)
+	assertKorrel8rTLSEndpoint(t, resources.deployment, resources.service, resources.networkPolicy)
+}
+
+type korrel8rRenderedResources struct {
+	config        string
+	metricsRule   string
+	deployment    *unstructured.Unstructured
+	service       *unstructured.Unstructured
+	networkPolicy *unstructured.Unstructured
+}
+
+func findKorrel8rRenderedResources(t *testing.T, objects []unstructured.Unstructured) korrel8rRenderedResources {
+	t.Helper()
+	resources := korrel8rRenderedResources{}
+	for i := range objects {
+		switch {
+		case objects[i].GetKind() == "ConfigMap" && objects[i].GetName() == "korrel8r-config":
+			config, _, err := unstructured.NestedString(objects[i].Object, "data", "korrel8r.yaml")
+			if err != nil {
+				t.Fatalf("reading Korrel8r config: %v", err)
+			}
+			resources.config = config
+			metricsRule, _, err := unstructured.NestedString(objects[i].Object, "data", "rhoai-metrics.yaml")
+			if err != nil {
+				t.Fatalf("reading Korrel8r metrics rule: %v", err)
+			}
+			resources.metricsRule = metricsRule
+		case objects[i].GetKind() == "Deployment" && objects[i].GetName() == Korrel8rServiceName:
+			resources.deployment = objects[i].DeepCopy()
+		case objects[i].GetKind() == "Service" && objects[i].GetName() == Korrel8rServiceName:
+			resources.service = objects[i].DeepCopy()
+		case objects[i].GetKind() == "NetworkPolicy" && objects[i].GetName() == Korrel8rServiceName:
+			resources.networkPolicy = objects[i].DeepCopy()
+		}
+	}
+	return resources
+}
+
+func assertKorrel8rConfiguration(t *testing.T, config, metricsRule string) {
+	t.Helper()
+	if config == "" {
+		t.Fatal("rendered Korrel8r ConfigMap is missing korrel8r.yaml")
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(config), &parsed); err != nil {
+		t.Fatalf("Korrel8r config is not valid YAML: %v", err)
+	}
+	tuning, ok := parsed["tuning"].(map[string]any)
+	if !ok {
+		t.Fatalf("Korrel8r config has no tuning section: %#v", parsed["tuning"])
+	}
+	if tuning["requestTimeout"] != "30s" || tuning["sessionTimeout"] != "5m" {
+		t.Errorf("unexpected tuning section: %#v", tuning)
+	}
+	for _, expected := range []string{
+		"domain: k8s",
+		"domain: metric",
+		"domain: trace",
+		"domain: log",
+		"direct: true",
+		"/etc/korrel8r/rules/all.yaml",
+		"/etc/korrel8r/custom/rhoai-metrics.yaml",
+		"requestTimeout: 30s",
+		"sessionTimeout: 5m",
+	} {
+		if !strings.Contains(config, expected) {
+			t.Errorf("Korrel8r config missing %q:\n%s", expected, config)
+		}
+	}
+	if !strings.Contains(metricsRule, `metric:metric:{exported_namespace="{{.metadata.namespace}}",exported_pod="{{.metadata.name}}"}`) {
+		t.Errorf("Korrel8r metrics rule must query the collector-exported Pod labels, got:\n%s", metricsRule)
+	}
+}
+
+func assertKorrel8rTLSEndpoint(t *testing.T, deployment, service, networkPolicy *unstructured.Unstructured) {
+	t.Helper()
+	if deployment == nil || service == nil || networkPolicy == nil {
+		t.Fatal("rendered Korrel8r resources are incomplete")
+	}
+	containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+	if err != nil || !found || len(containers) != 1 {
+		t.Fatalf("reading Korrel8r container: found=%t count=%d err=%v", found, len(containers), err)
+	}
+	container, ok := containers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("Korrel8r container has unexpected type %T", containers[0])
+	}
+	args, found, err := unstructured.NestedStringSlice(container, "args")
+	if err != nil || !found {
+		t.Fatalf("reading Korrel8r container args: found=%t err=%v", found, err)
+	}
+	if !slices.Contains(args, "--https=:8443") || !slices.Contains(args, "--mcp=false") {
+		t.Errorf("Korrel8r must use HTTPS with MCP disabled, got args %v", args)
+	}
+	annotations := service.GetAnnotations()
+	if annotations["service.beta.openshift.io/serving-cert-secret-name"] != "korrel8r-tls" {
+		t.Errorf("Korrel8r Service must request a serving certificate, got annotations %v", annotations)
+	}
+	policy := &networkingv1.NetworkPolicy{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(networkPolicy.Object, policy); err != nil {
+		t.Fatalf("converting Korrel8r NetworkPolicy: %v", err)
+	}
+	if !networkPolicyAllowsEgress(policy, "172.20.0.1/32", 6443) {
+		t.Errorf("Korrel8r NetworkPolicy must allow the Kubernetes API endpoint on 6443: %#v", policy.Spec.Egress)
+	}
+}
+
+func networkPolicyAllowsEgress(policy *networkingv1.NetworkPolicy, cidr string, port int32) bool {
+	for _, rule := range policy.Spec.Egress {
+		if !networkPolicyAllowsPort(rule, port) {
+			continue
+		}
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == cidr {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func networkPolicyAllowsPort(rule networkingv1.NetworkPolicyEgressRule, port int32) bool {
+	for _, policyPort := range rule.Ports {
+		protocol := corev1.ProtocolTCP
+		if policyPort.Protocol != nil {
+			protocol = *policyPort.Protocol
+		}
+		if protocol == corev1.ProtocolTCP && policyPort.Port != nil && policyPort.Port.IntVal == port {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNetworkPolicyAllowsPortRequiresTCP(t *testing.T) {
+	udp := corev1.ProtocolUDP
+	tcp := corev1.ProtocolTCP
+	for _, test := range []struct {
+		name     string
+		protocol *corev1.Protocol
+		want     bool
+	}{
+		{name: "nil protocol defaults to TCP", want: true},
+		{name: "explicit TCP", protocol: &tcp, want: true},
+		{name: "UDP is not API HTTPS", protocol: &udp, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rule := networkingv1.NetworkPolicyEgressRule{Ports: []networkingv1.NetworkPolicyPort{{
+				Protocol: test.protocol,
+				Port:     &intstr.IntOrString{Type: intstr.Int, IntVal: 6443},
+			}}}
+			if got := networkPolicyAllowsPort(rule, 6443); got != test.want {
+				t.Errorf("networkPolicyAllowsPort: want %t, got %t", test.want, got)
+			}
+		})
+	}
+}
+
+func TestHasReadyConditionAcceptsNamespacedConditionType(t *testing.T) {
+	t.Parallel()
+
+	obj := &unstructured.Unstructured{Object: map[string]any{}}
+	if err := unstructured.SetNestedSlice(obj.Object, []any{
+		map[string]any{
+			"type":   "observability.openshift.io/Ready",
+			"status": "True",
+		},
+	}, "status", "conditions"); err != nil {
+		t.Fatalf("setting conditions: %v", err)
+	}
+
+	ready, err := hasReadyCondition(obj)
+	if err != nil {
+		t.Fatalf("hasReadyCondition returned error: %v", err)
+	}
+	if !ready {
+		t.Fatal("hasReadyCondition returned false for a namespaced Ready condition")
 	}
 }

@@ -89,8 +89,19 @@ func (tc *MonitoringTestCtx) ValidateKorrel8rResources(t *testing.T) {
 		WithCondition(And(
 			jq.Match(`.data."korrel8r.yaml" | contains("domain: k8s") and contains("domain: metric") and contains("/etc/korrel8r/custom/rhoai-metrics.yaml")`),
 			jq.Match(`.data."rhoai-metrics.yaml" | contains("exported_namespace=\"{{.metadata.namespace}}\"") and contains("exported_pod=\"{{.metadata.name}}\"")`),
+			jq.Match(`
+				.data."korrel8r.yaml" | contains("/etc/korrel8r/rules/all.yaml") and
+				contains("/etc/korrel8r/custom/rhai-inference-rules.yaml")
+			`),
+			jq.Match(`
+				.data."rhai-inference-rules.yaml" |
+				contains("LLMInferenceService.v1alpha2.serving.kserve.io") and
+				contains("app.kubernetes.io/name") and
+				contains("app.kubernetes.io/part-of") and
+				contains("HTTPRoute.v1.gateway.networking.k8s.io")
+			`),
 		)),
-		WithCustomErrorMsg("Korrel8r ConfigMap should map Pods to collector-exported metric labels"),
+		WithCustomErrorMsg("Korrel8r ConfigMap should ship guarded RHOAI inference rules and retain built-in Pod telemetry rules"),
 	)
 
 	tc.EnsureResourceExists(

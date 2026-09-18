@@ -60,6 +60,7 @@ import (
 
 const (
 	monitoringFinalizer = "monitoring.opendatahub.io/cleanup"
+	monitoringPartOf    = "monitoring"
 	platformType        = "OpenDataHub"
 	platformConfigName  = "odh-" + v1alpha1.MonitoringServiceName + "-config"
 	platformVersionKey  = "platformVersion"
@@ -385,7 +386,7 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 	}
 
 	collector := gc.New(
-		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
+		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
 		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
@@ -416,7 +417,7 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 	}
 
 	collector := gc.New(
-		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
+		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
 		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 	)
@@ -509,7 +510,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// The prometheus-web-tls-ca ConfigMap is created by our template with this label,
 	// so CA rotation events are also covered without a separate watch.
 	managedPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return obj.GetLabels()[odhLabels.PlatformPartOf] == "monitoring"
+		return obj.GetLabels()[odhLabels.PlatformPartOf] == monitoringPartOf
 	})
 	platformConfigPredicate := predicate.NewPredicateFuncs(isPlatformConfigMap)
 

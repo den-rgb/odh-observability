@@ -11,7 +11,7 @@
         "backendRefs": [
           {"name": "llama-epp-service"},
           {"name": "llama-vllm-service", "namespace": "shared"},
-          {"name": "llama-pool", "kind": "InferencePool", "group": "inference.networking.k8s.io"}
+          {"name": "llama-pool", "kind": "InferencePool", "group": "inference.networking.x-k8s.io"}
         ]
       }
     ]

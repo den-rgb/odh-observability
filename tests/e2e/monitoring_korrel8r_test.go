@@ -69,7 +69,8 @@ func (tc *MonitoringTestCtx) ValidateKorrel8rResources(t *testing.T) {
 		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: korrel8rName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(jq.Match(`
 			([.spec.template.spec.containers[].args[] | select(. == "--https=:8443")] | length) == 1 and
-			([.spec.template.spec.containers[].args[] | select(. == "--mcp=false")] | length) == 1
+			([.spec.template.spec.containers[].args[] | select(. == "--mcp=false")] | length) == 1 and
+			(.spec.template.metadata.annotations."platform.opendatahub.io/korrel8r-config-checksum" | length) == 64
 		`)),
 		WithCustomErrorMsg("Korrel8r should expose only its TLS REST listener with MCP disabled"),
 	)
@@ -98,7 +99,9 @@ func (tc *MonitoringTestCtx) ValidateKorrel8rResources(t *testing.T) {
 				contains("LLMInferenceService.v1alpha2.serving.kserve.io") and
 				contains("app.kubernetes.io/name") and
 				contains("app.kubernetes.io/part-of") and
-				contains("HTTPRoute.v1.gateway.networking.k8s.io")
+				contains("HTTPRoute.v1.gateway.networking.k8s.io") and
+				contains("InferencePool.v1.inference.networking.k8s.io") and
+				contains("kserve.io/component")
 			`),
 		)),
 		WithCustomErrorMsg("Korrel8r ConfigMap should ship guarded RHOAI inference rules and retain built-in Pod telemetry rules"),

@@ -39,15 +39,76 @@ data:
             - Service
         result:
           query: |-
-            {{"{{"}}- $routeNamespace := .metadata.namespace {{"}}"}}
-            {{"{{"}}- range .spec.rules {{"}}"}}
-            {{"{{"}}- range .backendRefs {{"}}"}}
+            {{"{{"}}- with index .metadata "namespace" {{"}}"}}
+            {{"{{"}}- $routeNamespace := . {{"}}"}}
+            {{"{{"}}- with index $ "spec" {{"}}"}}
+            {{"{{"}}- range index . "rules" {{"}}"}}
+            {{"{{"}}- range (index . "backendRefs") {{"}}"}}
             {{"{{"}}- $name := index . "name" {{"}}"}}
             {{"{{"}}- $kind := index . "kind" {{"}}"}}
             {{"{{"}}- $group := index . "group" {{"}}"}}
             {{"{{"}}- if and $name (or (not $kind) (eq $kind "Service")) (or (not $group) (eq $group "")) {{"}}"}}
             {{"{{"}}- $namespace := index . "namespace" {{"}}"}}
             k8s:Service:{"namespace":"{{"{{"}}if $namespace{{"}}"}}{{"{{"}}$namespace{{"}}"}}{{"{{"}}else{{"}}"}}{{"{{"}}$routeNamespace{{"}}"}}{{"{{"}}end{{"}}"}}","name":"{{"{{"}}$name{{"}}"}}"}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+      - name: HTTPRouteToInferencePool
+        start:
+          domain: k8s
+          classes:
+            - HTTPRoute.v1.gateway.networking.k8s.io
+        goal:
+          domain: k8s
+          classes:
+            - InferencePool.v1.inference.networking.k8s.io
+        result:
+          query: |-
+            {{"{{"}}- with index .metadata "namespace" {{"}}"}}
+            {{"{{"}}- $routeNamespace := . {{"}}"}}
+            {{"{{"}}- with index $ "spec" {{"}}"}}
+            {{"{{"}}- range index . "rules" {{"}}"}}
+            {{"{{"}}- range index . "backendRefs" {{"}}"}}
+            {{"{{"}}- $name := index . "name" {{"}}"}}
+            {{"{{"}}- $kind := index . "kind" {{"}}"}}
+            {{"{{"}}- $group := index . "group" {{"}}"}}
+            {{"{{"}}- if and $name (eq $kind "InferencePool") (eq $group "inference.networking.x-k8s.io") {{"}}"}}
+            {{"{{"}}- $namespace := index . "namespace" {{"}}"}}
+            k8s:InferencePool.v1.inference.networking.k8s.io:{"namespace":"{{"{{"}}if $namespace{{"}}"}}{{"{{"}}$namespace{{"}}"}}{{"{{"}}else{{"}}"}}{{"{{"}}$routeNamespace{{"}}"}}{{"{{"}}end{{"}}"}}","name":"{{"{{"}}$name{{"}}"}}"}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+      - name: InferencePoolToServingPods
+        start:
+          domain: k8s
+          classes:
+            - InferencePool.v1.inference.networking.k8s.io
+        goal:
+          domain: k8s
+          classes:
+            - Pod
+        result:
+          query: |-
+            {{"{{"}}- with index .metadata "namespace" {{"}}"}}
+            {{"{{"}}- $namespace := . {{"}}"}}
+            {{"{{"}}- with index $ "spec" {{"}}"}}
+            {{"{{"}}- with index . "selector" {{"}}"}}
+            {{"{{"}}- with index . "matchLabels" {{"}}"}}
+            {{"{{"}}- $labels := . {{"}}"}}
+            {{"{{"}}- with index $labels "app.kubernetes.io/name" {{"}}"}}
+            {{"{{"}}- $name := . {{"}}"}}
+            {{"{{"}}- with index $labels "app.kubernetes.io/part-of" {{"}}"}}
+            {{"{{"}}- $partOf := . {{"}}"}}
+            {{"{{"}}- with index $labels "kserve.io/component" {{"}}"}}
+            k8s:Pod:{"namespace":"{{"{{"}}$namespace{{"}}"}}","labels":{"app.kubernetes.io/name":"{{"{{"}}$name{{"}}"}}","app.kubernetes.io/part-of":"{{"{{"}}$partOf{{"}}"}}","kserve.io/component":"{{"{{"}}.{{"}}"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
+            {{"{{"}}- end {{"}}"}}
             {{"{{"}}- end {{"}}"}}
             {{"{{"}}- end {{"}}"}}
             {{"{{"}}- end {{"}}"}}

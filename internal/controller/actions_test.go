@@ -851,8 +851,8 @@ func TestDeployClusterLogForwarder_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (CLF + RBAC), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy), got %d", len(sources))
 	}
 }
 
@@ -973,8 +973,8 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (CLF + RBAC) even when CLF is not ready, got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy) even when CLF is not ready, got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
@@ -1037,13 +1037,16 @@ func TestDeployClusterLogForwarder_UsesClusterLoggingNamespace(t *testing.T) {
 		t.Fatalf("rendering ClusterLogForwarder templates: %v", err)
 	}
 	for i := range objects {
-		if objects[i].GetKind() != "ClusterLogForwarder" && objects[i].GetKind() != "ServiceAccount" {
+		if objects[i].GetKind() != "ClusterLogForwarder" && objects[i].GetKind() != "ServiceAccount" && objects[i].GetKind() != "NetworkPolicy" {
 			continue
 		}
 		if objects[i].GetNamespace() != "openshift-logging" {
 			t.Fatalf("%s %q: want namespace openshift-logging, got %q", objects[i].GetKind(), objects[i].GetName(), objects[i].GetNamespace())
 		}
 		if objects[i].GetKind() != "ClusterLogForwarder" {
+			if objects[i].GetKind() == "NetworkPolicy" && objects[i].GetName() != ClusterLogForwarderNetworkPolicyName {
+				t.Fatalf("unexpected ClusterLogForwarder NetworkPolicy name %q", objects[i].GetName())
+			}
 			continue
 		}
 		outputs, found, err := unstructured.NestedSlice(objects[i].Object, "spec", "outputs")
@@ -1095,8 +1098,8 @@ func TestDeployClusterLogForwarder_ExplicitInferenceNamespaces(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources, got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources, got %d", len(sources))
 	}
 
 	data, err := buildTemplateData(context.Background(), cli, m, "")

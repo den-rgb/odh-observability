@@ -26,6 +26,7 @@ import (
 const (
 	clusterLoggingNamespace        = "openshift-logging"
 	clusterLogForwarderName        = "data-science-cluster-log-forwarder"
+	clusterLogForwarderPolicyName  = clusterLogForwarderName + "-allow"
 	clusterLogForwarderServiceAcct = clusterLogForwarderName + "-collector"
 	usageLogsSharedSecretName      = "test-loki-shared-secret"
 )
@@ -324,7 +325,52 @@ func (tc *MonitoringTestCtx) ValidateClusterLogForwarderContract(t *testing.T) {
 		"ClusterLogForwarder readiness requires an owned Vector DaemonSet with all desired pods ready")
 	if vector != nil {
 		t.Logf("ClusterLogForwarder evidence: name=%s vector_ready=%d vector_desired=%d", clusterLogForwarderName, vector.Status.NumberReady, vector.Status.DesiredNumberScheduled)
+		for _, owner := range vector.OwnerReferences {
+			if owner.Kind == gvk.Monitoring.Kind {
+				t.Fatalf("Vector DaemonSet must remain owned by ClusterLogForwarder, found Monitoring owner %q", owner.Name)
+			}
+		}
 	}
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: clusterLogForwarderPolicyName, Namespace: clusterLoggingNamespace}),
+		WithCondition(And(
+			tc.monitoringOwnerReferencesCondition(),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "collector"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, clusterLogForwarderName),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "vector"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/part-of" == "cluster-logging"`),
+			jq.Match(`.spec.policyTypes | contains(["Ingress", "Egress"])`),
+			jq.Match(`
+				any(.spec.ingress[]?;
+					any(.from[]?;
+						.namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-monitoring" and
+						.podSelector.matchLabels."app.kubernetes.io/instance" == "k8s") and
+					any(.ports[]?; .protocol == "TCP" and .port == 24231))
+			`),
+			jq.Match(`any(.spec.egress[]?; any(.to[]?; .namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-dns") and any(.ports[]?; .port == 53))`),
+			jq.Match(`any(.spec.egress[]?; any(.to[]?; .ipBlock.cidr != null) and any(.ports[]?; .protocol == "TCP" and .port == 6443))`),
+			jq.Match(`
+				any(.spec.egress[]?;
+					any(.to[]?;
+						.namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "%s" and
+						.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway") and
+					any(.ports[]?; .protocol == "TCP" and .port == 8080))
+			`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("Vector NetworkPolicy must be owned by Monitoring and restrict Prometheus, DNS, Kubernetes API, and Loki traffic"),
+	)
+
+	// A delete event must enqueue the singleton and recreate the cross-namespace policy.
+	tc.DeleteResource(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: clusterLogForwarderPolicyName, Namespace: clusterLoggingNamespace}),
+		WithWaitForDeletion(true),
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: clusterLogForwarderPolicyName, Namespace: clusterLoggingNamespace}),
+		WithCondition(tc.monitoringOwnerReferencesCondition()),
+		WithCustomErrorMsg("deleting the Vector NetworkPolicy must trigger cross-namespace reconciliation"),
+	)
 
 	// Direct pod-log access remains a fallback only; it must not replace the
 	// historical Loki store when logs are configured.
@@ -333,6 +379,14 @@ func (tc *MonitoringTestCtx) ValidateClusterLogForwarderContract(t *testing.T) {
 		WithCondition(jq.Match(`.data."korrel8r.yaml" | contains("domain: log") and contains("direct: true") and contains("application")`)),
 		WithCustomErrorMsg("Korrel8r log store must retain the application tenant and direct pod-log fallback"),
 	)
+
+	// Removing logs must remove both the ClusterLogForwarder and its companion policy.
+	tc.updateMonitoringConfigWithoutReady(
+		withManagementState(common.Managed),
+		jq.Transform(`del(.spec.logs)`),
+	)
+	tc.EnsureResourceGone(WithMinimalObject(gvk.ClusterLogForwarder, types.NamespacedName{Name: clusterLogForwarderName, Namespace: clusterLoggingNamespace}))
+	tc.EnsureResourceGone(WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: clusterLogForwarderPolicyName, Namespace: clusterLoggingNamespace}))
 }
 
 func (tc *MonitoringTestCtx) clusterLogForwarderCRDAvailable(t *testing.T) bool {

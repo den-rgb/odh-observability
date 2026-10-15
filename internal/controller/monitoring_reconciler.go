@@ -529,7 +529,7 @@ func isOwnedByMonitoring(monitoring client.Object, obj metav1.Object) bool {
 }
 
 func isInMonitoringScope(obj metav1.Object, namespace string) bool {
-	return obj.GetNamespace() == "" || obj.GetNamespace() == namespace
+	return obj.GetNamespace() == "" || obj.GetNamespace() == namespace || obj.GetNamespace() == clusterLoggingNamespace
 }
 
 func isTargetAllocatorSecretRBAC(obj unstructured.Unstructured) bool {

@@ -23,8 +23,10 @@ import (
 	"testing"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -395,6 +397,81 @@ func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
 	ingress := nestedSlice(t, policy, "spec", "ingress")
 	if len(ingress) != 0 {
 		t.Fatalf("Korrel8r NetworkPolicy must deny ingress because no stable in-cluster caller exists, got %#v", ingress)
+	}
+}
+
+func TestClusterLogForwarderNetworkPolicyTemplateContract(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, ClusterLogForwarderNetworkPolicyTemplate, map[string]any{
+		"ClusterLogForwarderName":              "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderNetworkPolicyName": ClusterLogForwarderNetworkPolicyName,
+		"ClusterLoggingNamespace":              "openshift-logging",
+		"KubernetesAPIServerCIDRs":             []string{"172.20.0.1/32"},
+		"LokiStackName":                        "data-science-lokistack",
+		"Namespace":                            testMonitoringNamespace,
+	})
+
+	policy := findRenderedResource(t, resources, "NetworkPolicy", ClusterLogForwarderNetworkPolicyName)
+	if policy.GetNamespace() != "openshift-logging" {
+		t.Fatalf("Vector NetworkPolicy must live in openshift-logging, got %q", policy.GetNamespace())
+	}
+
+	selector, found, err := unstructured.NestedStringMap(policy.Object, "spec", "podSelector", "matchLabels")
+	if err != nil || !found {
+		t.Fatalf("Vector NetworkPolicy selector is missing: found=%t error=%v", found, err)
+	}
+	wantSelector := map[string]string{
+		"app.kubernetes.io/component": "collector",
+		"app.kubernetes.io/instance":  "data-science-cluster-log-forwarder",
+		"app.kubernetes.io/name":      "vector",
+		"app.kubernetes.io/part-of":   "cluster-logging",
+	}
+	if !reflect.DeepEqual(selector, wantSelector) {
+		t.Fatalf("Vector NetworkPolicy selector: want %#v, got %#v", wantSelector, selector)
+	}
+
+	var rendered networkingv1.NetworkPolicy
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(policy.Object, &rendered); err != nil {
+		t.Fatalf("converting Vector NetworkPolicy: %v", err)
+	}
+	if !reflect.DeepEqual(rendered.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}) {
+		t.Fatalf("Vector NetworkPolicy policy types: got %v", rendered.Spec.PolicyTypes)
+	}
+	if len(rendered.Spec.Ingress) != 1 || len(rendered.Spec.Ingress[0].From) != 1 || len(rendered.Spec.Ingress[0].Ports) != 1 {
+		t.Fatalf("Vector NetworkPolicy must have one explicit Prometheus ingress peer and port: %#v", rendered.Spec.Ingress)
+	}
+	ingressPeer := rendered.Spec.Ingress[0].From[0]
+	if ingressPeer.NamespaceSelector == nil || ingressPeer.PodSelector == nil {
+		t.Fatalf("Vector NetworkPolicy Prometheus peer must select both namespace and pod: %#v", ingressPeer)
+	}
+	if got := ingressPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"]; got != "openshift-monitoring" {
+		t.Fatalf("Vector NetworkPolicy Prometheus namespace: got %q", got)
+	}
+	if got := ingressPeer.PodSelector.MatchLabels["app.kubernetes.io/instance"]; got != "k8s" {
+		t.Fatalf("Vector NetworkPolicy Prometheus instance: got %q", got)
+	}
+	if rendered.Spec.Ingress[0].Ports[0].Port == nil || rendered.Spec.Ingress[0].Ports[0].Port.IntValue() != 24231 {
+		t.Fatalf("Vector NetworkPolicy must allow metrics TCP/24231: %#v", rendered.Spec.Ingress[0].Ports)
+	}
+
+	if len(rendered.Spec.Egress) != 3 {
+		t.Fatalf("Vector NetworkPolicy must have DNS, API, and Loki egress rules: %#v", rendered.Spec.Egress)
+	}
+	if !networkPolicyAllowsEgress(&rendered, "172.20.0.1/32", 6443) {
+		t.Fatalf("Vector NetworkPolicy must allow the discovered Kubernetes API endpoint: %#v", rendered.Spec.Egress)
+	}
+	if !networkPolicyAllowsPort(rendered.Spec.Egress[0], 53) || !networkPolicyAllowsPort(rendered.Spec.Egress[0], 5353) {
+		t.Fatalf("Vector NetworkPolicy must allow DNS ports 53 and 5353: %#v", rendered.Spec.Egress[0])
+	}
+	lokiPeer := rendered.Spec.Egress[2].To[0]
+	if lokiPeer.NamespaceSelector == nil || lokiPeer.PodSelector == nil ||
+		lokiPeer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != testMonitoringNamespace ||
+		lokiPeer.PodSelector.MatchLabels["app.kubernetes.io/component"] != "lokistack-gateway" {
+		t.Fatalf("Vector NetworkPolicy Loki peer is not restricted to the gateway: %#v", lokiPeer)
+	}
+	if !networkPolicyAllowsPort(rendered.Spec.Egress[2], 8080) {
+		t.Fatalf("Vector NetworkPolicy must allow Loki gateway TCP/8080: %#v", rendered.Spec.Egress[2])
 	}
 }
 

@@ -791,6 +791,17 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 			wantTargetGC: false,
 		},
 		{
+			name: "cluster logging namespace resource uses main collector",
+			obj: ownedGarbageCollectionTestObject(
+				schema.GroupVersionKind{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
+				clusterLoggingNamespace,
+				ClusterLogForwarderNetworkPolicyName,
+				monitoring.UID,
+			),
+			wantMainGC:   true,
+			wantTargetGC: false,
+		},
+		{
 			name:         "cluster-scoped resource uses main collector",
 			obj:          clusterRole,
 			wantMainGC:   true,

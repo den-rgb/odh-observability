@@ -641,6 +641,15 @@ func deployClusterLogForwarder(
 		return nil
 	}
 
+	// Keep the CLF resources in the desired state while Loki is starting or
+	// recovering. Otherwise garbage collection treats them as stale and
+	// removes the cross-namespace resources during a transient Loki outage.
+	*sources = append(*sources,
+		src(ClusterLogForwarderTemplate),
+		src(ClusterLogForwarderRBACTemplate),
+		src(ClusterLogForwarderNetworkPolicyTemplate),
+	)
+
 	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
@@ -665,11 +674,6 @@ func deployClusterLogForwarder(
 			"ClusterLogForwarder is not ready yet")
 	}
 
-	*sources = append(*sources,
-		src(ClusterLogForwarderTemplate),
-		src(ClusterLogForwarderRBACTemplate),
-		src(ClusterLogForwarderNetworkPolicyTemplate),
-	)
 	return nil
 }
 

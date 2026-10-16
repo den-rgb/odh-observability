@@ -915,8 +915,8 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 0 {
-		t.Errorf("expected no sources when LokiStack is not ready, got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy) when LokiStack is not ready, got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)

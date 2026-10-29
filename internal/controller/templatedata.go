@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
@@ -375,16 +376,34 @@ func kubernetesAPIServerCIDRs(endpointSlices []discoveryv1.EndpointSlice) ([]str
 // Returns a missingOperatorsError listing all confirmed missing operators, or
 // the operational error encountered while checking for them.
 func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+	_, err := checkMonitoringPreconditionsWithCOOVersion(ctx, c, monitoring)
+	return err
+}
+
+// checkMonitoringPreconditionsWithCOOVersion returns the installed COO version
+// when built-in metrics storage requires COO, along with any precondition error.
+func checkMonitoringPreconditionsWithCOOVersion(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+) (*cluster.OperatorInfo, error) {
 	var allErrors *multierror.Error
+	var cooInfo *cluster.OperatorInfo
 
 	usageLogsConfigured := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
 	needsLoki := monitoring.Spec.Logs != nil || usageLogsConfigured
 
 	checkOperatorNames := func(names []string, missingMessage string) error {
 		for _, name := range names {
-			_, err := olm.OperatorExists(ctx, c, name)
+			info, err := olm.OperatorExists(ctx, c, name)
 			switch {
 			case err == nil:
+				if name == clusterObservabilityOperator {
+					cooInfo, err = cooInstalledCSVVersion(ctx, c, info)
+					if err != nil {
+						return fmt.Errorf("checking installed Cluster Observability Operator CSV: %w", err)
+					}
+				}
 				return nil
 			case errors.Is(err, olm.ErrOperatorNotInstalled):
 				continue
@@ -401,7 +420,7 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 
 	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsConfigured {
 		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
@@ -413,40 +432,138 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 			[]string{certManagerOperator, "openshift-cert-manager-operator"},
 			conditions.CertManagerOperatorMissingMessage,
 		); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	// COO owns MonitoringStack/Thanos/Perses; only required for built-in metrics storage.
 	if monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil {
 		if err := checkOperator(clusterObservabilityOperator, conditions.COOMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	// Tempo is only required for built-in storage; exporters-only traces use the collector.
 	if monitoring.Spec.Traces != nil && monitoring.Spec.Traces.Storage != nil {
 		if err := checkOperator(tempoOperator, conditions.TempoOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if needsLoki {
 		if err := checkOperator(lokiOperator, conditions.LokiOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if monitoring.Spec.Logs != nil {
 		if err := checkOperator(clusterLoggingOperator, conditions.ClusterLoggingOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if err := allErrors.ErrorOrNil(); err != nil {
-		return &missingOperatorsError{err: err}
+		return cooInfo, &missingOperatorsError{err: err}
 	}
-	return nil
+	return cooInfo, nil
+}
+
+// cooInstalledCSVVersion uses the current successful OLMv0 CSV as the
+// authoritative COO version. OperatorCondition names can include an old
+// version while an upgrade is in progress. If the CSV API is unavailable,
+// retain the version supplied by OperatorExists for OLMv1 installations.
+func cooInstalledCSVVersion(
+	ctx context.Context,
+	c client.Reader,
+	fallback *cluster.OperatorInfo,
+) (*cluster.OperatorInfo, error) {
+	csvList := &unstructured.UnstructuredList{}
+	csvList.SetGroupVersionKind(gvk.ClusterServiceVersion.GroupVersion().WithKind("ClusterServiceVersionList"))
+	if err := c.List(ctx, csvList); err != nil {
+		if meta.IsNoMatchError(err) {
+			return fallback, nil
+		}
+		return nil, err
+	}
+
+	type installedCSV struct {
+		name      string
+		namespace string
+		version   string
+	}
+
+	const namePrefix = clusterObservabilityOperator + "."
+	var installed []installedCSV
+	replaced := make(map[string]struct{})
+	for i := range csvList.Items {
+		csv := &csvList.Items[i]
+		name := csv.GetName()
+		if !strings.HasPrefix(name, namePrefix) {
+			continue
+		}
+
+		phase, found, err := unstructured.NestedString(csv.Object, "status", "phase")
+		if err != nil {
+			return nil, fmt.Errorf("reading CSV %q status.phase: %w", name, err)
+		}
+		if !found || phase != "Succeeded" {
+			continue
+		}
+
+		installed = append(installed, installedCSV{
+			name:      name,
+			namespace: csv.GetNamespace(),
+			version:   strings.TrimPrefix(name, namePrefix),
+		})
+		replaces, hasReplaces, err := unstructured.NestedString(csv.Object, "spec", "replaces")
+		if err != nil {
+			return nil, fmt.Errorf("reading CSV %q spec.replaces: %w", name, err)
+		}
+		if hasReplaces {
+			replaced[csv.GetNamespace()+"/"+replaces] = struct{}{}
+		}
+	}
+
+	// During an upgrade, the new succeeded CSV replaces the previous one. If
+	// multiple versions are still succeeded, select the terminal CSV in that
+	// replacement chain rather than relying on API list order.
+	var current []installedCSV
+	for _, csv := range installed {
+		if _, wasReplaced := replaced[csv.namespace+"/"+csv.name]; !wasReplaced {
+			current = append(current, csv)
+		}
+	}
+	if len(current) != 1 {
+		extensionInfo, err := cluster.OperatorInstalledViaClusterExtension(ctx, c, clusterObservabilityOperator)
+		if err != nil && !meta.IsNoMatchError(err) {
+			return nil, fmt.Errorf("checking installed Cluster Observability Operator ClusterExtension: %w", err)
+		}
+		if extensionInfo != nil {
+			return extensionInfo, nil
+		}
+		return cluster.NewOperatorInfo(""), nil
+	}
+	return cluster.NewOperatorInfo(current[0].version), nil
+}
+
+func markCOOVersionCompatibility(cm *conditions.ConditionsManager, info *cluster.OperatorInfo) {
+	supportedPrefix := conditions.COOSupportedVersionLine + "."
+	if info == nil || info.Version == "" {
+		cm.MarkWarning(conditions.ConditionCOOVersionCompatible, "VersionUnavailable",
+			fmt.Sprintf("Unable to determine the installed Cluster Observability Operator version; the supported version line is %s.x", conditions.COOSupportedVersionLine))
+		return
+	}
+	if strings.HasPrefix(info.Version, supportedPrefix) {
+		cm.MarkTrue(conditions.ConditionCOOVersionCompatible)
+		return
+	}
+
+	message := fmt.Sprintf(
+		"Detected Cluster Observability Operator version %s outside the supported version line %s.x; this combination is untested",
+		info.Version,
+		conditions.COOSupportedVersionLine,
+	)
+	cm.MarkWarning(conditions.ConditionCOOVersionCompatible, "UnsupportedVersion", message)
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {

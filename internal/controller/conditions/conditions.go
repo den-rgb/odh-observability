@@ -26,6 +26,14 @@ import (
 
 // Monitoring-specific condition type constants.
 const (
+	// ConditionCOOVersionCompatible reports whether the installed COO version is
+	// within the version line validated for the current RHOAI release.
+	ConditionCOOVersionCompatible = "COOVersionCompatible"
+
+	// COOSupportedVersionLine is the Cluster Observability Operator minor line
+	// validated by the RHOAI 3.6 compatibility release gate.
+	COOSupportedVersionLine = "v1.5"
+
 	// ConditionMonitoringDependenciesReady indicates whether all external
 	// operators required by the configured monitoring features are installed.
 	ConditionMonitoringDependenciesReady = "MonitoringDependenciesReady"
@@ -160,6 +168,18 @@ func (cm *ConditionsManager) MarkFalse(condType, reason, message string) {
 		Status:             metav1.ConditionFalse,
 		Reason:             reason,
 		Message:            message,
+		ObservedGeneration: cm.generation,
+	})
+}
+
+// MarkWarning sets a non-blocking condition to False with informational severity.
+func (cm *ConditionsManager) MarkWarning(condType, reason, message string) {
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
+		Type:               condType,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		Severity:           platformcommon.ConditionSeverityInfo,
 		ObservedGeneration: cm.generation,
 	})
 }

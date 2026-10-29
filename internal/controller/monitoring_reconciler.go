@@ -118,6 +118,7 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes/custom-host,verbs=create
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=operatorconditions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=operators.coreos.com,resources=clusterserviceversions,verbs=list
 // +kubebuilder:rbac:groups=olm.operatorframework.io,resources=clusterextensions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
@@ -184,10 +185,12 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (result ctrl.Result, reconcileErr error) {
 	log := logf.FromContext(ctx)
 	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
+	cooCompatibilityConfigured := initializeCOOVersionCompatibilityCondition(cm, monitoring)
 	var platformVersion string
 	stampPlatform := false
 
 	defer func() {
+		result = requeueForCOOVersionRefresh(result, cooCompatibilityConfigured, reconcileErr)
 		if reconcileErr != nil {
 			message := reconcileErr.Error()
 			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ReconcileFailed", message)
@@ -243,7 +246,9 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	// Check prerequisite operators.
-	if err := checkMonitoringPreconditions(ctx, r.Client, monitoring); err != nil {
+	cooInfo, err := checkMonitoringPreconditionsWithCOOVersion(ctx, r.Client, monitoring)
+	markCOOVersionCompatibility(cm, cooInfo)
+	if err != nil {
 		var missingOperators *missingOperatorsError
 		if !errors.As(err, &missingOperators) {
 			return ctrl.Result{}, err
@@ -367,6 +372,25 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func initializeCOOVersionCompatibilityCondition(cm *conditions.ConditionsManager, monitoring *v1alpha1.Monitoring) bool {
+	configured := monitoring.Spec.ManagementState != platformcommon.Removed &&
+		monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil
+	if !configured {
+		cm.MarkNotConfigured(conditions.ConditionCOOVersionCompatible, "NotApplicable",
+			"COO compatibility is checked only when built-in metrics storage is configured")
+	}
+	return configured
+}
+
+// requeueForCOOVersionRefresh schedules a bounded refresh because OLM version
+// changes do not trigger a Monitoring reconcile.
+func requeueForCOOVersionRefresh(result ctrl.Result, configured bool, reconcileErr error) ctrl.Result {
+	if reconcileErr == nil && configured && result == (ctrl.Result{}) {
+		result.RequeueAfter = 5 * time.Minute
+	}
+	return result
 }
 
 // cleanupOpenTelemetryOperatorNetworkPolicies removes policies left behind by

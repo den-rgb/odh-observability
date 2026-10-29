@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
@@ -52,6 +53,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	controllergvk "github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
@@ -189,6 +191,20 @@ func registerOperatorConditionTypes(s *runtime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v2", Kind: "OperatorConditionList",
 	}, &unstructured.UnstructuredList{})
+}
+
+func registerClusterServiceVersionTypes(s *runtime.Scheme) {
+	s.AddKnownTypeWithName(controllergvk.ClusterServiceVersion, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(controllergvk.ClusterServiceVersion.GroupVersion().WithKind("ClusterServiceVersionList"),
+		&unstructured.UnstructuredList{})
+}
+
+func newClusterServiceVersion(name, phase string) *unstructured.Unstructured {
+	csv := &unstructured.Unstructured{}
+	csv.SetGroupVersionKind(controllergvk.ClusterServiceVersion)
+	csv.SetName(name)
+	_ = unstructured.SetNestedField(csv.Object, phase, "status", "phase")
+	return csv
 }
 
 func platformConfigMap(ns, version string) *corev1.ConfigMap {
@@ -437,6 +453,226 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 		if !strings.Contains(dependenciesReady.Message, expected) {
 			t.Errorf("MonitoringDependenciesReady message %q does not contain %q", dependenciesReady.Message, expected)
 		}
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityCondition(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		version          string
+		wantStatus       metav1.ConditionStatus
+		wantReason       string
+		wantSeverity     platformcommon.ConditionSeverity
+		wantMessageParts []string
+	}{
+		{
+			name:             "unsupported version is informational",
+			version:          "v1.4.0",
+			wantStatus:       metav1.ConditionFalse,
+			wantReason:       "UnsupportedVersion",
+			wantSeverity:     platformcommon.ConditionSeverityInfo,
+			wantMessageParts: []string{"v1.4.0", "v1.5.x"},
+		},
+		{
+			name:       "supported version is compatible",
+			version:    "v1.5.2",
+			wantStatus: metav1.ConditionTrue,
+			wantReason: "Available",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestScheme(t)
+			registerOperatorConditionTypes(s)
+			registerClusterServiceVersionTypes(s)
+
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			m.Spec.Metrics = &v1alpha1.Metrics{
+				Storage: &v1alpha1.MetricsStorage{},
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+				m,
+				newOperatorCondition("cluster-observability-operator."+tt.version),
+				newClusterServiceVersion("cluster-observability-operator."+tt.version, "Succeeded"),
+			).WithStatusSubresource(m).Build()
+			r := newTestReconciler(t, s, cli)
+
+			var previousTransitionTime *metav1.Time
+			if tt.wantStatus == metav1.ConditionTrue {
+				lastTransitionTime := metav1.NewTime(time.Now().Add(-time.Hour))
+				previousTransitionTime = &lastTransitionTime
+				m.Status.Conditions = append(m.Status.Conditions, platformcommon.Condition{
+					Type:               "COOVersionCompatible",
+					Status:             metav1.ConditionTrue,
+					Reason:             "Available",
+					LastTransitionTime: lastTransitionTime,
+				})
+			}
+
+			result, err := r.reconcile(context.Background(), m)
+			if err != nil {
+				t.Fatalf("reconcile returned error: %v", err)
+			}
+			if result.RequeueAfter != 5*time.Minute {
+				t.Errorf("RequeueAfter: want %s to refresh COO version, got %s", 5*time.Minute, result.RequeueAfter)
+			}
+
+			var compatibility, degraded *platformcommon.Condition
+			for i := range m.Status.Conditions {
+				condition := &m.Status.Conditions[i]
+				switch condition.Type {
+				case "COOVersionCompatible":
+					compatibility = condition
+				case string(platformcommon.ConditionTypeDegraded):
+					degraded = condition
+				}
+			}
+			if compatibility == nil {
+				t.Fatal("COOVersionCompatible condition was not reported")
+			}
+			if compatibility.Status != tt.wantStatus {
+				t.Errorf("COOVersionCompatible status: want %q, got %q", tt.wantStatus, compatibility.Status)
+			}
+			if compatibility.Reason != tt.wantReason {
+				t.Errorf("COOVersionCompatible reason: want %q, got %q", tt.wantReason, compatibility.Reason)
+			}
+			if compatibility.Severity != tt.wantSeverity {
+				t.Errorf("COOVersionCompatible severity: want %q, got %q", tt.wantSeverity, compatibility.Severity)
+			}
+			for _, expected := range tt.wantMessageParts {
+				if !strings.Contains(compatibility.Message, expected) {
+					t.Errorf("COOVersionCompatible message %q does not contain %q", compatibility.Message, expected)
+				}
+			}
+			if degraded == nil || degraded.Status != metav1.ConditionFalse {
+				t.Errorf("Degraded: want False for an informational COO compatibility warning, got %v", degraded)
+			}
+
+			if previousTransitionTime != nil {
+				if !compatibility.LastTransitionTime.Equal(previousTransitionTime) {
+					t.Errorf("COOVersionCompatible LastTransitionTime changed during reconcile: want %s, got %s",
+						previousTransitionTime, compatibility.LastTransitionTime)
+				}
+
+				if _, err := r.reconcile(context.Background(), m); err != nil {
+					t.Fatalf("second reconcile returned error: %v", err)
+				}
+				compatibility = mustFindCondition(t, m, "COOVersionCompatible")
+				if !compatibility.LastTransitionTime.Equal(previousTransitionTime) {
+					t.Errorf("COOVersionCompatible LastTransitionTime changed on second reconcile: want %s, got %s",
+						previousTransitionTime, compatibility.LastTransitionTime)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+	registerClusterServiceVersionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+	oldCSV := newClusterServiceVersion("cluster-observability-operator.v1.4.0", "Succeeded")
+	currentCSV := newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded")
+	_ = unstructured.SetNestedField(currentCSV.Object, oldCSV.GetName(), "spec", "replaces")
+
+	// OLM can leave an older OperatorCondition behind while the current CSV
+	// identifies the version that is actually installed.
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		m,
+		newOperatorCondition("cluster-observability-operator.v1.4.0"),
+		oldCSV,
+		currentCSV,
+	).WithStatusSubresource(m).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	compatibility := mustFindCondition(t, m, "COOVersionCompatible")
+	if compatibility.Status != metav1.ConditionTrue || compatibility.Reason != "Available" {
+		t.Fatalf("COOVersionCompatible: want True/Available from installed CSV, got %s/%s (%s)",
+			compatibility.Status, compatibility.Reason, compatibility.Message)
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityOnSuccessfulReconcile(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+	registerClusterServiceVersionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	caConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: prometheusWebTLSCAConfigMapName, Namespace: m.Spec.Namespace},
+		Data:       map[string]string{serviceCACertificateKey: "test-ca"},
+	}
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: prometheusWebTLSCAConfigMapName, Namespace: m.Spec.Namespace},
+		Type:       corev1.SecretTypeOpaque,
+		Data:       map[string][]byte{serviceCACertificateKey: []byte("test-ca")},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		m,
+		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
+		newOperatorCondition("cluster-observability-operator.v1.4.0"),
+		newOperatorCondition("cert-manager-operator.v1.20.1"),
+		newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded"),
+		caConfigMap,
+		caSecret,
+	).WithStatusSubresource(m).WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error with all required operators installed: %v", err)
+	}
+
+	compatibility := mustFindCondition(t, m, "COOVersionCompatible")
+	if compatibility.Status != metav1.ConditionTrue || compatibility.Reason != "Available" {
+		t.Fatalf("COOVersionCompatible: want True/Available on successful reconcile, got %s/%s (%s)",
+			compatibility.Status, compatibility.Reason, compatibility.Message)
+	}
+	dependenciesReady := mustFindCondition(t, m, conditions.ConditionMonitoringDependenciesReady)
+	if dependenciesReady.Status != metav1.ConditionTrue {
+		t.Fatalf("MonitoringDependenciesReady: want True on successful reconcile, got %s", dependenciesReady.Status)
+	}
+}
+
+func TestReconcile_COOVersionCompatibilityClearsWhenCOOMissing(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+	m.Status.Conditions = append(m.Status.Conditions, platformcommon.Condition{
+		Type:   "COOVersionCompatible",
+		Status: metav1.ConditionTrue,
+		Reason: "Available",
+	})
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build()
+	r := newTestReconciler(t, s, cli)
+
+	if _, err := r.reconcile(context.Background(), m); err != nil {
+		t.Fatalf("reconcile returned error: %v", err)
+	}
+
+	compatibility := mustFindCondition(t, m, "COOVersionCompatible")
+	if compatibility.Status != metav1.ConditionFalse || compatibility.Reason != "VersionUnavailable" {
+		t.Fatalf("COOVersionCompatible: want False/VersionUnavailable when COO is absent, got %s/%s (%s)",
+			compatibility.Status, compatibility.Reason, compatibility.Message)
 	}
 }
 
@@ -773,9 +1009,12 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
 		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
-	_, err := r.reconcile(context.Background(), m)
+	result, err := r.reconcile(context.Background(), m)
 	if err != nil {
 		t.Fatalf("reconcile returned error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter: want 0 when built-in metrics storage is not configured, got %s", result.RequeueAfter)
 	}
 
 	var ready, degraded, dependenciesReady, legacyAvailable string

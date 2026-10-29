@@ -121,6 +121,29 @@ func TestAggregateReady_AllFeaturesWorking(t *testing.T) {
 	}
 }
 
+// TestAggregateReady_COOVersionWarningIsNonBlocking verifies compatibility
+// warnings do not affect top-level health conditions.
+func TestAggregateReady_COOVersionWarningIsNonBlocking(t *testing.T) {
+	t.Parallel()
+
+	cm, acc := newTestCM()
+	cm.MarkTrue(ConditionMonitoringDependenciesReady)
+	markAllNotConfigured(cm)
+	cm.MarkWarning(ConditionCOOVersionCompatible, "UnsupportedVersion", "COO v1.4.0 is outside the supported line v1.5.x")
+
+	cm.AggregateReady()
+
+	if got := ready(acc); got != metav1.ConditionTrue {
+		t.Errorf("Ready: want True with an informational COO version warning, got %s", got)
+	}
+	if got := degraded(acc); got != metav1.ConditionFalse {
+		t.Errorf("Degraded: want False with an informational COO version warning, got %s", got)
+	}
+	if got := provisioning(acc); got != metav1.ConditionTrue {
+		t.Errorf("ProvisioningSucceeded: want True with an informational COO version warning, got %s", got)
+	}
+}
+
 // TestAggregateReady_ConfiguredFeatureFailing: metrics is configured but the
 // MonitoringStack CRD is missing. Should be Ready=False, Degraded=True.
 func TestAggregateReady_ConfiguredFeatureFailing(t *testing.T) {

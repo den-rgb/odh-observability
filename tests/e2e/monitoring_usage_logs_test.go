@@ -41,11 +41,10 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 
 	t.Run("Group 11: Usage Logs Collection", func(t *testing.T) {
 		tc = tc.WithT(t)
-		const sharedSecretName = usageLogsSharedSecretName
 		const lifecycleSecretName = "test-loki-lifecycle-secret"
 		t.Cleanup(tc.cleanupSeaweedFS)
 		t.Cleanup(func() {
-			for _, secretName := range []string{sharedSecretName, lifecycleSecretName} {
+			for _, secretName := range []string{usageLogsLokiSecretName, logsLokiSecretName, lifecycleSecretName} {
 				tc.DeleteResource(
 					WithMinimalObject(gvk.Secret, types.NamespacedName{Name: secretName, Namespace: tc.MonitoringNamespace}),
 					WithIgnoreNotFound(true),
@@ -58,11 +57,12 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		// Test 1: Validate not deployed without config (modifies state, run first)
 		t.Run("Test Usage Logs Collector not deployed without usage logs config", tc.ValidateUsageLogsCollectorNotDeployedWithoutConfig)
 
-		// Setup shared resources once for validation tests
-		tc.startSeaweedFS(t, lokiS3Bucket)
-		t.Run("Setup shared UsageLogs resources", func(t *testing.T) {
+		// Set up the resources the validation tests share once. The two LokiStacks
+		// have independent storage, so the fixture serves one bucket per stack.
+		tc.startSeaweedFS(t, lokiS3Bucket, logsS3Bucket)
+		if !t.Run("Setup UsageLogs resources", func(t *testing.T) {
 			tc = tc.WithT(t)
-			tc.setupUsageLogsWithStorage(t, "s3", sharedSecretName)
+			tc.setupUsageLogsWithStorage(t, "s3", usageLogsLokiSecretName)
 
 			// Wait for everything to be ready
 			tc.EnsureResourceExists(
@@ -70,7 +70,7 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 				WithCondition(And(
 					jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
 					jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsCollectorAvailable, metav1.ConditionTrue),
-					jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionLokiStackAvailable, metav1.ConditionTrue),
+					jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsLokiStackAvailable, metav1.ConditionTrue),
 				)),
 				WithCustomErrorMsg("Shared setup: Monitoring should be ready with UsageLogs"),
 			)
@@ -81,17 +81,28 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 					Namespace: tc.MonitoringNamespace,
 				}),
 			)
-		})
+		}) {
+			return
+		}
 
 		// Shared-resource checks run before stateful certificate rotation and lifecycle tests.
 		// LokiStack tests run first since OTEL depends on LokiStack.
-		t.Run("Validate LokiStack deployment", tc.ValidateUsageLogsLokiStackDeployment)
-		t.Run("Validate LokiStack configuration", tc.ValidateUsageLogsLokiStackConfiguration)
+		t.Run("Validate usage logs LokiStack deployment", tc.ValidateUsageLogsLokiStackDeployment)
+		t.Run("Validate usage logs LokiStack configuration", tc.ValidateUsageLogsLokiStackConfiguration)
 		t.Run("Validate Usage Logs Collector deployment", tc.ValidateUsageLogsCollectorDeployment)
 		t.Run("Validate Usage Logs Collector configuration", tc.ValidateUsageLogsCollectorConfiguration)
 		t.Run("Validate Usage Logs Collector RBAC", tc.ValidateUsageLogsCollectorRBACConfiguration)
 		t.Run("Validate Usage Logs Collector network policies", tc.ValidateUsageLogsCollectorNetworkPolicies)
+
+		// Log forwarding owns a second, independent LokiStack. It is configured on
+		// top of the usage logs setup so the two are exercised side by side.
+		if !t.Run("Setup log forwarding resources", tc.setupLogsLokiStack) {
+			return
+		}
+		t.Run("Validate log forwarding LokiStack deployment", tc.ValidateLogsLokiStackDeployment)
+		t.Run("Validate log forwarding LokiStack configuration", tc.ValidateLogsLokiStackConfiguration)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
+		t.Run("Validate log forwarding LokiStack removal", tc.ValidateLogsLokiStackRemoved)
 		t.Run("Test Usage Logs Collector serving certificate rotation", tc.ValidateUsageLogsCollectorServingCertificateRotation)
 
 		// Lifecycle removes the collector and LokiStack, so it runs last.
@@ -137,14 +148,13 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNotDeployedWithoutConfig(
 
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
 
 	for _, name := range []string{
 		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
-		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
 	} {
 		tc.EnsureResourceGone(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
@@ -167,7 +177,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorDeployment(t *testing.T) 
 			jq.Match(`.spec.usageLogs.storage.credentialMode == "static"`),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsCollectorAvailable, metav1.ConditionTrue),
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionLokiStackAvailable, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsLokiStackAvailable, metav1.ConditionTrue),
 		)),
 		WithCustomErrorMsg("Monitoring resource should be ready with logs configuration and UsageLogsCollector and LokiStack available"),
 	)
@@ -561,8 +571,12 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 				[.spec.config.processors."transform/cleanup".log_statements[].statements[] | select(test("service.namespace"))] | length == 1
 			`),
 
-			// Verify exporter endpoint (auto-generated from LokiStack)
-			jq.Match(`.spec.config.exporters."otlphttp/loki".endpoint | test("https://data-science-lokistack-gateway-http\\..+\\.svc\\.cluster\\.local:8080/api/logs/v1/application/otlp")`),
+			// Verify exporter endpoint (auto-generated from the usage logs LokiStack,
+			// never from the log forwarding one).
+			jq.Match(
+				`.spec.config.exporters."otlphttp/loki".endpoint | test("https://%s-gateway-http\\..+\\.svc\\.cluster\\.local:8080/api/logs/v1/application/otlp")`,
+				UsageLogsLokiStackName,
+			),
 			jq.Match(`
 				(.spec.config.exporters."otlphttp/loki".tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
 				(.spec.config.exporters."otlphttp/loki".auth.authenticator == "bearertokenauth")
@@ -667,7 +681,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 		WithCondition(And(
 			// Guards the gateway pods that receive the connection.
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, UsageLogsLokiStackName),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
 			jq.Match(`
 				[.spec.ingress[].from[] | .podSelector.matchLabels."app.kubernetes.io/name"] == ["%s"]
@@ -677,43 +691,6 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 			`),
 		)),
 		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should only admit the usage logs collector on 8080"),
-	)
-
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
-			Name:      "data-science-lokistack-ingress",
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithCondition(And(
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "lokistack"`),
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
-			jq.Match(`.spec.policyTypes == ["Ingress"]`),
-			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3100, 7946, 9095]`),
-		)),
-		WithCustomErrorMsg("LokiStack NetworkPolicy should restrict component ingress to declared peers"),
-	)
-
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
-			Name:      "data-science-lokistack-gateway-ingress",
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithCondition(And(
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
-			jq.Match(`.spec.policyTypes == ["Ingress"]`),
-			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].from[] | .namespaceSelector.matchLabels."kubernetes.io/metadata.name"] | map(select(. == "openshift-logging")) | length == 1`),
-			jq.Match(`
-				[.spec.ingress[].from[] | .podSelector.matchLabels |
-					select(."app.kubernetes.io/name" == "korrel8r" and
-						."app.kubernetes.io/component" == "correlation" and
-						."app.kubernetes.io/part-of" == "monitoring")] | length == 1
-			`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique == [8080]`),
-		)),
-		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit only declared in-namespace and CLO traffic"),
 	)
 }
 
@@ -730,7 +707,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCustomErrorMsg("LokiStack should be deployed when usage logs are enabled"),
@@ -747,7 +724,6 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	for _, name := range []string{
 		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
-		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
 	} {
 		tc.EnsureResourceExists(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
@@ -761,7 +737,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionLokiStackAvailable, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsLokiStackAvailable, metav1.ConditionTrue),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsCollectorAvailable, metav1.ConditionTrue),
 		)),
 		WithCustomErrorMsg("LokiStackAvailable and UsageLogsCollectorAvailable conditions should be True when usage logs are enabled"),
@@ -775,7 +751,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
@@ -789,7 +765,6 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	for _, name := range []string{
 		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
-		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
 	} {
 		tc.EnsureResourceGone(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
@@ -802,7 +777,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionLokiStackAvailable, metav1.ConditionFalse),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsLokiStackAvailable, metav1.ConditionFalse),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsCollectorAvailable, metav1.ConditionFalse),
 		)),
 		WithCustomErrorMsg("LokiStackAvailable and UsageLogsCollectorAvailable conditions should be False when usage logs are disabled"),
@@ -813,7 +788,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCustomErrorMsg("LokiStack should be recreated when usage logs are re-enabled"),
@@ -830,7 +805,6 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	for _, name := range []string{
 		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
-		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
 	} {
 		tc.EnsureResourceExists(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
@@ -844,7 +818,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionLokiStackAvailable, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsLokiStackAvailable, metav1.ConditionTrue),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsCollectorAvailable, metav1.ConditionTrue),
 		)),
 		WithCustomErrorMsg("LokiStackAvailable and UsageLogsCollectorAvailable conditions should be True when usage logs are re-enabled"),
@@ -859,12 +833,12 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackDeployment(t *testing.T) 
 	// Verify LokiStack CR is created
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
-			jq.Match(`.spec.size == "1x.extra-small"`),
+			jq.Match(`.spec.size == "1x.demo"`),
 			jq.Match(`.spec.storage.secret.type == "s3"`),
 			jq.Match(`.spec.storage.secret.credentialMode == "static"`),
 			jq.Match(`.spec.storageClassName == "%s"`, tc.DefaultStorageClass),
@@ -877,7 +851,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackDeployment(t *testing.T) 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionLokiStackAvailable, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionUsageLogsLokiStackAvailable, metav1.ConditionTrue),
 		),
 		WithCustomErrorMsg("LokiStackAvailable condition should be True when LokiStack is deployed"),
 	)
@@ -890,7 +864,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackConfiguration(t *testing.
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(
